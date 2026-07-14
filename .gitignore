@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Compiled C++
+*.o
+*.obj
+*.out
+*.exe
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+*.slo
+*.lo
+*.gch
+*.pch
+
+*.txt

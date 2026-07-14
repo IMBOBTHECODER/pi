@@ -1,0 +1,1 @@
+g++ -O3 -march=native -flto -DNDEBUG chudnovsky.cpp -lmpfr -lgmp -o main
