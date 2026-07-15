@@ -213,7 +213,7 @@
 											"type": "bold"
 										}
 									],
-									"text": "1300000 digits"
+									"text": "1450000 digits"
 								},
 								{
 									"type": "text",
@@ -271,8 +271,8 @@
 			"typeName": "shape"
 		},
 		{
-			"x": -102.59816392657946,
-			"y": 97.34214366460988,
+			"x": 338.13886906066074,
+			"y": 491.6158470041537,
 			"z": 0.5505443234836703,
 			"meta": {},
 			"id": "camera:page:page",
@@ -522,10 +522,10 @@
 			"typeName": "shape"
 		},
 		{
-			"editingShapeId": "shape:n4BaPWiwMcnjA7QdYOGPQ",
+			"editingShapeId": "shape:T9d9zL_EgdX2BLjBVtcU-",
 			"croppingShapeId": null,
 			"selectedShapeIds": [
-				"shape:n4BaPWiwMcnjA7QdYOGPQ"
+				"shape:T9d9zL_EgdX2BLjBVtcU-"
 			],
 			"hoveredShapeId": null,
 			"erasingShapeIds": [],
@@ -1321,7 +1321,7 @@
 							"content": [
 								{
 									"type": "text",
-									"text": "Goal: 1 million Pi digits in <1s"
+									"text": "Goal: 2 million Pi digits in <1s"
 								}
 							]
 						}

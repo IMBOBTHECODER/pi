@@ -1,3 +1,10 @@
+*
+!*.*
+!Makefile
+!README
+!LICENSE
+!.gitignore
+
 # Python cache
 __pycache__/
 *.py[cod]
@@ -22,3 +29,7 @@ __pycache__/
 *.pch
 
 *.txt
+
+build/
+bin/
+out/
