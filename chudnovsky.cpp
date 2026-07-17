@@ -15,8 +15,8 @@
 #include <sys/resource.h>
 #endif
 
-// 640320^3
-static mpz_t C3;
+// 640320^3 / 24 (exact) -- the reduced leaf denominator, see bs
+static mpz_t C3_24;
 
 struct Triple {
     mpz_t P, Q, T;
@@ -33,7 +33,6 @@ struct Triple {
     Triple& operator=(const Triple&) = delete;
 };
 
-
 // 3nd design (C++, Incremental + GMP)
 //
 // Uses the ratio between consecutive terms to compute each term from the previous one
@@ -45,6 +44,10 @@ void incremental_chudnovsky(mpf_t result, unsigned long n)
     mp_bitcnt_t prec = mpf_get_prec(result);
     unsigned long term = (n + 13) / 14; // ceil(n / 14)
 
+    // 640320^3. Local: bs uses the reduced C3/24, so this design is its only user.
+    mpz_t C3;
+    mpz_init(C3);
+    mpz_ui_pow_ui(C3, 640320, 3);
 
     mpz_t AkB;
     mpz_init_set_ui(AkB, 13591409);
@@ -108,6 +111,7 @@ void incremental_chudnovsky(mpf_t result, unsigned long n)
     mpf_mul_ui(pi, pi, 12);
     mpf_ui_div(result, 1, pi);
 
+    mpz_clear(C3);
     mpz_clear(AkB);
     mpz_clear(num_k);
     mpz_clear(den_k);
@@ -126,15 +130,15 @@ static double log2_integral(unsigned long long lo, unsigned long long hi)
     double b = (double)hi;
     return b * log2(b) - a * log2(a) - (b - a) * 1.4426950408889634;
 }
-// base = 6 * log2_integral(lo, hi), count = hi - lo. Passing the precomputed base
+// base = 3 * log2_integral(lo, hi), count = hi - lo. Passing the precomputed base
 // means the integral (two log2 calls) is done once per range, not once per field.
 static mp_bitcnt_t p_bits(double base, unsigned long long count)
 {
-    return (mp_bitcnt_t)(base + 16.0 * (double)count) + 64;
+    return (mp_bitcnt_t)(base + 7.0 * (double)count) + 64;
 }
 static mp_bitcnt_t q_bits(double base, unsigned long long count)
 {
-    return (mp_bitcnt_t)(base + 63.0 * (double)count) + 64;
+    return (mp_bitcnt_t)(base + 54.0 * (double)count) + 64;
 }
 static mp_bitcnt_t t_bits(double base, unsigned long long count, unsigned long long hi)
 {
@@ -149,7 +153,9 @@ static const unsigned long MIN_LEAF = 2048;
 // (near the root, where cores are free); smaller nodes merge serially. ~39k digits.
 static const size_t COMBINE_PAR_BITS = 1u << 17;
 
-// Binary-splitting core: (P, Q, T) for the term range [lo, hi). Merge rule:
+// Binary-splitting core: (P, Q, T) for the term range [lo, hi). The leaf uses the
+// reduced p/q -- the raw (6k)!/(3k)!(k!)^3 form shares a factor of 8(3k)(3k-1)(3k-2)
+// between P and Q that cancels in T/Q; dropping it halves every operand. Merge rule:
 //     P = left.P * right.P
 //     Q = left.Q * right.Q
 //     T = left.T * right.Q + left.P * right.T
@@ -167,25 +173,18 @@ void bs(unsigned long long lo, unsigned long long hi, Triple& out, int par_depth
             mpz_set_ui(out.Q, 1);
         } else {
             unsigned long long k6 = 6 * lo;
-            unsigned long long k3 = k6 / 2;      // = 3*lo
 
-            // P = -(6k-5)(6k-4)(6k-3)(6k-2)(6k-1)(6k),  k = lo
+            // P = -(6k-5)(2k-1)(6k-1),  k = lo
             mpz_set_ui(out.P, k6 - 5);
-            mpz_mul_ui(out.P, out.P, k6 - 4);
-            mpz_mul_ui(out.P, out.P, k6 - 3);
-            mpz_mul_ui(out.P, out.P, k6 - 2);
+            mpz_mul_ui(out.P, out.P, 2 * lo - 1);
             mpz_mul_ui(out.P, out.P, k6 - 1);
-            mpz_mul_ui(out.P, out.P, k6);
             mpz_neg(out.P, out.P);
 
-            // Q = (3k-2)(3k-1)(3k) * k^3 * C3
-            mpz_set_ui(out.Q, k3 - 2);
-            mpz_mul_ui(out.Q, out.Q, k3 - 1);
-            mpz_mul_ui(out.Q, out.Q, k3);
+            // Q = k^3 * C3/24
+            mpz_set_ui(out.Q, lo);
             mpz_mul_ui(out.Q, out.Q, lo);
             mpz_mul_ui(out.Q, out.Q, lo);
-            mpz_mul_ui(out.Q, out.Q, lo);
-            mpz_mul(out.Q, out.Q, C3);
+            mpz_mul(out.Q, out.Q, C3_24);
         }
 
         // T = (545140134*lo + 13591409) * P   (linear factor fits in <96 bits)
@@ -201,7 +200,7 @@ void bs(unsigned long long lo, unsigned long long hi, Triple& out, int par_depth
 
     unsigned long long mid = (lo + hi) / 2;
     unsigned long long cL = mid - lo, cR = hi - mid;
-    double baseL = 6.0 * log2_integral(lo, mid), baseR = 6.0 * log2_integral(mid, hi);
+    double baseL = 3.0 * log2_integral(lo, mid), baseR = 3.0 * log2_integral(mid, hi);
     Triple left (p_bits(baseL, cL), q_bits(baseL, cL), t_bits(baseL, cL, mid)),
            right(p_bits(baseR, cR), q_bits(baseR, cR), t_bits(baseR, cR, hi));
 
@@ -280,7 +279,7 @@ void bs_chudnovsky(mpz_t result, unsigned long digits)
     mpz_init(S);
     mpz_init(scale);
 
-    double base = 6.0 * log2_integral(0, terms);
+    double base = 3.0 * log2_integral(0, terms);
     Triple sum(p_bits(base, terms), q_bits(base, terms), t_bits(base, terms, terms));
 #ifdef _OPENMP
     #pragma omp parallel
@@ -450,9 +449,10 @@ int main(int argc, char **argv)
         }
     }
 
-    // 640320^3, shared constant used by bs. Init once here.
-    mpz_init(C3);
-    mpz_ui_pow_ui(C3, 640320, 3);
+    // 640320^3 / 24, shared constant used by bs. Exact: 640320^3 is divisible by 24.
+    mpz_init(C3_24);
+    mpz_ui_pow_ui(C3_24, 640320, 3);
+    mpz_divexact_ui(C3_24, C3_24, 24);
 
     mpz_t pi_bs;
     mpz_init(pi_bs);
@@ -482,6 +482,6 @@ int main(int argc, char **argv)
     }
 
     mpz_clear(pi_bs);
-    mpz_clear(C3);
+    mpz_clear(C3_24);
     return 0;
 }

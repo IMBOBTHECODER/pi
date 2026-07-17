@@ -77,6 +77,46 @@ def incremental_chudnovsky(n: int):
 
     return div(1, 12 * pi)
 
+# 3rd design (Python, Binary Splitting + GMP)
+def bs_chudnovsky(n: int):
+    """
+    A function that uses the Chudnovsky algorithm with binary splitting to compute Pi
+
+    A range of terms is kept as one exact fraction via a triple (P, Q, T); ranges
+    merge with integer arithmetic only, so there is a single division at the end
+    instead of one per term. This is the simple, serial reference — the optimised,
+    parallel version lives in chudnovsky.cpp (see DESIGN.md).
+
+    n: number of digits
+    """
+    gmpy2.get_context().precision = int(n * 3.3219) + 64
+    terms = math.ceil(n / 14) + 1
+
+    C3 = 262537412640768000  # 640320^3
+
+    def binary_split(a, b):
+        # (P, Q, T) for the term range [a, b)
+        if b - a == 1:
+            k = a
+            if k == 0:
+                P = mpz_(1)
+                Q = mpz_(1)
+            else:
+                P = mpz_(-(6*k - 5)*(6*k - 4)*(6*k - 3)*(6*k - 2)*(6*k - 1)*(6*k))
+                Q = mpz_((3*k - 2)*(3*k - 1)*(3*k) * k*k*k * C3)
+            T = P * (545140134*k + 13591409)
+            return P, Q, T
+
+        m = (a + b) // 2
+        lP, lQ, lT = binary_split(a, m)
+        rP, rQ, rT = binary_split(m, b)
+        return lP*rP, lQ*rQ, lT*rQ + lP*rT
+
+    P, Q, T = binary_split(0, terms)
+
+    # pi = 426880 * sqrt(10005) * Q / T
+    return div(426880 * sqrt(mpfr_(10005)) * Q, T)
+
 if __name__ == "__main__":
     x = int(input())
     

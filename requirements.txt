@@ -1,0 +1,3 @@
+# Dependencies for the chudnovsky.py reference prototype.
+# gmpy2 wraps GMP/MPFR; install libgmp-dev (and libmpfr-dev) first.
+gmpy2>=2.1.0
