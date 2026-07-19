@@ -34,3 +34,7 @@ __pycache__/
 build/
 bin/
 out/
+
+# Local machine maintenance -- paths are specific to this host's .wslconfig
+reclaim-swap.ps1
+reclaim-swap.sh

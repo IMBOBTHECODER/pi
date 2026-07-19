@@ -2,17 +2,20 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-// for raising the process scheduling priority (see main)
+// for the process scheduling priority and the system info banner (see main)
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>          // peak working set -- link with -lpsapi
 #else
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 // 640320^3 / 24 (exact) -- the reduced leaf denominator, see bs
@@ -28,6 +31,10 @@ struct Triple {
         mpz_init2(T, tb);
     }
     ~Triple() { mpz_clears(P, Q, T, NULL); }
+    // Hand back a field's storage once it's been consumed. Can't mpz_clear it --
+    // the destructor still owns it -- so shrink to GMP's minimum instead, which
+    // frees the limbs and leaves a valid (zeroed) mpz behind.
+    static void release(mpz_t x) { mpz_realloc2(x, 1); }
     // prevent accidental copies (they'd double-clear)
     Triple(const Triple&) = delete;
     Triple& operator=(const Triple&) = delete;
@@ -121,14 +128,21 @@ void incremental_chudnovsky(mpf_t result, unsigned long n)
 }
 
 // Upper bounds (bits) on P, Q, T for a term range, so a Triple can be
-// preallocated and its merge multiplies never realloc. Derivation in README.
+// preallocated and its merge multiplies never realloc. Derivation in DESIGN.md
+// ("Preallocation bounds").
 
-// integral of log2 over [lo, hi)  (1/ln2 = 1.4426950408889634)
+// Antiderivative of log2: F(x) = x*log2(x) - x/ln2  (1/ln2 = 1.4426950408889634),
+// clamped at x = 1 since term 0 is trivial and log2(0) is undefined. One log2 call,
+// so a node sharing an endpoint between two ranges evaluates it once (see bs).
+static double log2_antideriv(unsigned long long v)
+{
+    double x = (v < 1) ? 1.0 : (double)v;
+    return x * log2(x) - x * 1.4426950408889634;
+}
+// integral of log2 over [lo, hi)
 static double log2_integral(unsigned long long lo, unsigned long long hi)
 {
-    double a = (lo < 1) ? 1.0 : (double)lo;
-    double b = (double)hi;
-    return b * log2(b) - a * log2(a) - (b - a) * 1.4426950408889634;
+    return log2_antideriv(hi) - log2_antideriv(lo);
 }
 // base = 3 * log2_integral(lo, hi), count = hi - lo. Passing the precomputed base
 // means the integral (two log2 calls) is done once per range, not once per field.
@@ -142,7 +156,8 @@ static mp_bitcnt_t q_bits(double base, unsigned long long count)
 }
 static mp_bitcnt_t t_bits(double base, unsigned long long count, unsigned long long hi)
 {
-    return q_bits(base, count) + 2 * (mp_bitcnt_t)log2((double)hi) + 32;
+    // floor(log2(hi)) via clz, not libm: hi >= 1 here, so clzll is well-defined.
+    return q_bits(base, count) + 2 * (mp_bitcnt_t)(63 - __builtin_clzll(hi)) + 32;
 }
 
 // Below this many terms a subtree stops spawning tasks. On a balanced tree this
@@ -161,7 +176,7 @@ static const size_t COMBINE_PAR_BITS = 1u << 17;
 //     T = left.T * right.Q + left.P * right.T
 // Subtrees are independent, so they run as OpenMP tasks. need_p: a node builds
 // its P only if the parent uses it (the right spine, incl. the root, doesn't).
-// See README for the algorithm and optimisations.
+// See DESIGN.md for the algorithm and optimisations.
 void bs(unsigned long long lo, unsigned long long hi, Triple& out, int par_depth, bool need_p = false)
 {
     unsigned long long count = hi - lo;
@@ -189,7 +204,7 @@ void bs(unsigned long long lo, unsigned long long hi, Triple& out, int par_depth
 
         // T = (545140134*lo + 13591409) * P   (linear factor fits in <96 bits)
         mpz_t ak;
-        mpz_init2(ak, 96);
+        mpz_init2(ak, 80);
         mpz_set_ui(ak, 545140134UL);
         mpz_mul_ui(ak, ak, lo);
         mpz_add_ui(ak, ak, 13591409UL);
@@ -200,7 +215,9 @@ void bs(unsigned long long lo, unsigned long long hi, Triple& out, int par_depth
 
     unsigned long long mid = (lo + hi) / 2;
     unsigned long long cL = mid - lo, cR = hi - mid;
-    double baseL = 3.0 * log2_integral(lo, mid), baseR = 3.0 * log2_integral(mid, hi);
+    // The two child ranges meet at mid, so F(mid) serves both: 3 log2 calls, not 4.
+    double fLo = log2_antideriv(lo), fMid = log2_antideriv(mid), fHi = log2_antideriv(hi);
+    double baseL = 3.0 * (fMid - fLo), baseR = 3.0 * (fHi - fMid);
     Triple left (p_bits(baseL, cL), q_bits(baseL, cL), t_bits(baseL, cL, mid)),
            right(p_bits(baseR, cR), q_bits(baseR, cR), t_bits(baseR, cR, hi));
 
@@ -255,7 +272,7 @@ void bs(unsigned long long lo, unsigned long long hi, Triple& out, int par_depth
 
 // Chudnovsky via binary splitting. All-integer final step: work at D digits and
 // scale by 10^D, so S = floor(sqrt(10005*10^(2D))) and pi*10^D ~ 426880*Q*S/T.
-// `result` receives floor(pi * 10^digits). See README.
+// `result` receives floor(pi * 10^digits). See DESIGN.md ("All-integer final step").
 void bs_chudnovsky(mpz_t result, unsigned long digits)
 {
     const unsigned long GUARD = 16;               // guard digits absorb the floors
@@ -275,9 +292,8 @@ void bs_chudnovsky(mpz_t result, unsigned long digits)
     while ((terms >> (max_depth + 1)) >= MIN_LEAF) ++max_depth;
     if (par_depth > max_depth) par_depth = max_depth;
 
-    mpz_t S, scale;
+    mpz_t S;
     mpz_init(S);
-    mpz_init(scale);
 
     double base = 3.0 * log2_integral(0, terms);
     Triple sum(p_bits(base, terms), q_bits(base, terms), t_bits(base, terms, terms));
@@ -289,12 +305,17 @@ void bs_chudnovsky(mpz_t result, unsigned long digits)
         // S depends only on the precision, not on the series, so run it as a
         // sibling task that overlaps the tree instead of adding to the tail.
 #ifdef _OPENMP
-        #pragma omp task shared(S, scale)
+        #pragma omp task shared(S)
 #endif
         {
-            mpz_ui_pow_ui(scale, 10, 2 * D);  // 10^(2D)
-            mpz_mul_ui(S, scale, 10005);
+            // Built in place: a separate 10^(2D) would sit allocated at ~2D digits
+            // (~290 MB at 350M) for the whole tree, unread. sqrt then shrinks the
+            // value to D digits but not the allocation, so hand that half back too
+            // -- this is the peak, and it is concurrent with the tree.
+            mpz_ui_pow_ui(S, 10, 2 * D);      // 10^(2D)
+            mpz_mul_ui(S, S, 10005);
             mpz_sqrt(S, S);                   // S = floor(sqrt(10005 * 10^(2D)))
+            mpz_realloc2(S, (mp_bitcnt_t)((double)D * 3.3219280948873627) + 64);
         }
 
         bs(0, terms, sum, par_depth);   // root P is unused (need_p defaults false)
@@ -304,22 +325,29 @@ void bs_chudnovsky(mpz_t result, unsigned long digits)
 #endif
     }
 
-    // result = 426880 * Q * S / T  ~ pi * 10^D
+    // result = 426880 * Q * S / T  ~ pi * 10^D. Q, S and T are each ~n digits or
+    // more and are dead the moment they're consumed, so release the storage before
+    // the next step allocates. S is a local, so it clears outright.
     mpz_mul(result, sum.Q, S);
+    mpz_clear(S);
+    Triple::release(sum.Q);
     mpz_mul_ui(result, result, 426880);
     mpz_tdiv_q(result, result, sum.T);
+    Triple::release(sum.T);
 
-    // drop the guard digits: / 10^GUARD  ->  floor(pi * 10^digits)
+    // drop the guard digits: / 10^GUARD  ->  floor(pi * 10^digits). Declared here,
+    // not up top: it holds 17 digits, so there is nothing to gain by sharing it
+    // with the 10^(2D) above and ~2D digits to lose.
+    mpz_t scale;
+    mpz_init(scale);
     mpz_ui_pow_ui(scale, 10, GUARD);
     mpz_tdiv_q(result, result, scale);
-
-    mpz_clear(S);
     mpz_clear(scale);
 }
 
 // ---- Parallel base-10 conversion ------------------------------------------
 // mpn_get_str is single-threaded, so split the number by powers of ten and
-// convert the halves as OpenMP tasks. See README.
+// convert the halves as OpenMP tasks. See DESIGN.md ("Parallel base-10 conversion").
 
 static const unsigned long OUT_BASE = 1024;   // convert chunks this small with GMP
 static const unsigned long OUT_PAR  = 32768;   // spawn tasks above this width
@@ -346,7 +374,8 @@ static void to_decimal(const mpz_t x, unsigned long width, char *out, mpz_t *pw)
     unsigned long hi_width = width - lo_width;
 
     // hi/lo have <= hi_width/lo_width digits; preallocate (log2(10) bits/digit,
-    // over-estimated) + guard so mpz_tdiv_qr doesn't realloc. See README.
+    // over-estimated) + guard so mpz_tdiv_qr doesn't realloc. See DESIGN.md
+    // ("Preallocation bounds", last paragraph).
     mpz_t hi, lo;
     mpz_init2(hi, (mp_bitcnt_t)(hi_width * 3.3219280948873627) + 64);
     mpz_init2(lo, (mp_bitcnt_t)(lo_width * 3.3219280948873627) + 64);
@@ -369,23 +398,20 @@ static void to_decimal(const mpz_t x, unsigned long width, char *out, mpz_t *pw)
 // Write "3.<n digits>\n" of pi_int (= floor(pi*10^n)) to f.
 static void write_pi(FILE *f, const mpz_t pi_int, unsigned long n)
 {
-    // 10^n and pi_int mod 10^n have <= n digits; preallocate (log2(10) bits/digit,
-    // over-estimated) + guard so the pow/mod don't realloc. See README.
-    mp_bitcnt_t bits = (mp_bitcnt_t)(n * 3.3219280948873627) + 64;
-    mpz_t tenN, frac;
-    mpz_init2(tenN, bits);
-    mpz_init2(frac, bits);
-    mpz_ui_pow_ui(tenN, 10, n);
-    mpz_tdiv_r(frac, pi_int, tenN);            // low n digits (the fractional part)
+    // pi_int is already the digit string we want: "3" followed by exactly n
+    // decimals (3 <= pi < 4, so 10^n <= pi_int < 10^(n+1)). Convert it whole and
+    // insert the point -- splitting the fractional part off first would cost a
+    // 10^n and an n-digit remainder, both as large as the output itself.
+    unsigned long width = n + 1;
+    char *buf = new char[width];
 
-    char *buf = new char[n];
-
-    if (n <= OUT_BASE) {
-        to_decimal(frac, n, buf, NULL);        // base case only; pw unused
+    if (width <= OUT_BASE) {
+        to_decimal(pi_int, width, buf, NULL);  // base case only; pw unused
     } else {
-        // pw[i] = 10^(2^i) for i = 0 .. Kmax-1, built by repeated squaring
+        // pw[i] = 10^(2^i) for i = 0 .. Kmax-1, built by repeated squaring.
+        // Sized from width, not n: to_decimal reads up to pw[ceil(log2(width))-1].
         int Kmax = 0;
-        while ((1UL << Kmax) < n) ++Kmax;
+        while ((1UL << Kmax) < width) ++Kmax;
         mpz_t *pw = new mpz_t[Kmax];
         mpz_init_set_ui(pw[0], 10);
         for (int i = 1; i < Kmax; ++i) {
@@ -397,22 +423,208 @@ static void write_pi(FILE *f, const mpz_t pi_int, unsigned long n)
         #pragma omp parallel
         #pragma omp single nowait
 #endif
-        to_decimal(frac, n, buf, pw);
+        to_decimal(pi_int, width, buf, pw);
 
         for (int i = 0; i < Kmax; ++i) mpz_clear(pw[i]);
         delete[] pw;
     }
 
-    fputc('3', f);
+    fputc(buf[0], f);                          // the leading '3'
     fputc('.', f);
-    fwrite(buf, 1, n, f);
+    fwrite(buf + 1, 1, n, f);
     fputc('\n', f);
 
     delete[] buf;
-    mpz_clear(tenN);
-    mpz_clear(frac);
 }
 // ---------------------------------------------------------------------------
+
+// Render a duration for printing. Under a minute, keep full precision -- that's the
+// benchmarking range. Past that, trim to 2dp (8 decimals of an hour-long run is
+// noise) and add the larger units, since "3601s" doesn't read as an hour:
+//   5.71246496s   /   90.12s | 1.50m   /   3601.00s | 60.02m | 1.00h
+static void format_secs(char *buf, size_t n, double s)
+{
+    if (s < 60.0)
+        snprintf(buf, n, "%.8fs", s);
+    else if (s < 3600.0)
+        snprintf(buf, n, "%.2fs | %.2fm", s, s / 60.0);
+    else
+        snprintf(buf, n, "%.2fs | %.2fm | %.2fh", s, s / 60.0, s / 3600.0);
+}
+
+// ---- System info ----------------------------------------------------------
+// Printed before the run so benchmark output says what produced it.
+
+// Pull one "key: value" field out of /proc/<file>. Returns false if not found.
+#ifndef _WIN32
+static bool proc_field(const char *path, const char *key, char *out, size_t n)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[512];
+    size_t klen = strlen(key);
+    bool found = false;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, key, klen) != 0) continue;
+        char *v = strchr(line, ':');
+        if (!v) continue;
+        for (++v; *v == ' ' || *v == '\t'; ++v) {}       // skip separator space
+        size_t len = strlen(v);
+        while (len && (v[len - 1] == '\n' || v[len - 1] == '\r')) v[--len] = '\0';
+        snprintf(out, n, "%s", v);
+        found = true;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+#endif
+
+static void print_sysinfo(void)
+{
+    char cpu[160] = "unknown";
+    double ram = 0, avail = 0, swap = 0;                 // GiB
+    int logical = 1, cores = 0;                          // cores 0 = unknown
+
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    logical = (int)si.dwNumberOfProcessors;
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) {
+        ram   = (double)ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+        avail = (double)ms.ullAvailPhys / (1024.0 * 1024.0 * 1024.0);
+    }
+    DWORD sz = sizeof cpu;
+    RegGetValueA(HKEY_LOCAL_MACHINE,
+                 "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                 "ProcessorNameString", RRF_RT_REG_SZ, NULL, cpu, &sz);
+#else
+    logical = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    proc_field("/proc/cpuinfo", "model name", cpu, sizeof cpu);
+    char buf[64];
+    if (proc_field("/proc/cpuinfo", "cpu cores", buf, sizeof buf))
+        cores = atoi(buf);
+    // /proc/meminfo values are in kB
+    if (proc_field("/proc/meminfo", "MemTotal", buf, sizeof buf))
+        ram = atof(buf) / (1024.0 * 1024.0);
+    if (proc_field("/proc/meminfo", "MemAvailable", buf, sizeof buf))
+        avail = atof(buf) / (1024.0 * 1024.0);
+    if (proc_field("/proc/meminfo", "SwapTotal", buf, sizeof buf))
+        swap = atof(buf) / (1024.0 * 1024.0);
+#endif
+
+    int threads = logical;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+
+    printf("CPU:     %s\n", cpu);
+    // "cores" is whatever the OS claims. Under a VM (WSL2) that topology is
+    // synthesised and can disagree with the physical chip -- a hybrid P/E-core
+    // CPU gets flattened -- so it's labelled as reported, not asserted.
+    if (cores > 0)
+        printf("Threads: %d OpenMP | %d logical | %d cores (as reported)\n",
+               threads, logical, cores);
+    else
+        printf("Threads: %d OpenMP | %d logical\n", threads, logical);
+    printf("Memory:  %.1f GiB total | %.1f GiB available", ram, avail);
+    if (swap > 0)
+        printf(" | %.1f GiB swap", swap);
+    printf("\n");
+#ifndef _OPENMP
+    printf("         (built without OpenMP -- single-threaded)\n");
+#endif
+}
+
+// Peak resident set since process start, in MiB (0 if unavailable). This is a
+// high-water mark the kernel maintains for us, so reading it at the end reports
+// the true peak -- no sampling, and no need to catch the tree mid-descent.
+static double peak_rss_mb(void)
+{
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
+        return (double)pmc.PeakWorkingSetSize / (1024.0 * 1024.0);
+    return 0.0;
+#else
+    // VmHWM is the peak; VmRSS would only be the value at this instant.
+    char buf[64];
+    if (proc_field("/proc/self/status", "VmHWM", buf, sizeof buf))
+        return atof(buf) / 1024.0;               // kB -> MiB
+    // No /proc: ru_maxrss is the same figure, in kB on Linux.
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+        return (double)ru.ru_maxrss / 1024.0;
+    return 0.0;
+#endif
+}
+
+// Render a byte count the way the run is usually discussed: MiB up to ~1 GiB,
+// GiB past that, since a peak in the GB range is what limits digit counts.
+static void format_mem(char *buf, size_t n, double mb)
+{
+    if (mb < 1024.0)
+        snprintf(buf, n, "%.1f MiB", mb);
+    else
+        snprintf(buf, n, "%.2f GiB (%.0f MiB)", mb / 1024.0, mb);
+}
+
+// Parse a digit count, accepting a k/M/G suffix and scientific notation so that
+// "200M" or "2e8" can stand in for counting zeros. The mantissa may be
+// fractional ("2.5M"); the result is rounded. Returns false on anything else,
+// which is also how "-p" decides whether the word after it is a filename.
+static bool parse_digits(const char *s, unsigned long *out)
+{
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s) return false;
+    switch (*end) {
+        case 'k': case 'K': v *= 1e3; ++end; break;
+        case 'm': case 'M': v *= 1e6; ++end; break;
+        case 'g': case 'G': v *= 1e9; ++end; break;
+        default: break;
+    }
+    // the range test also rejects inf/nan, which strtod would otherwise accept
+    if (*end != '\0' || !(v >= 1.0) || v > 1e12) return false;
+    *out = (unsigned long)(v + 0.5);
+    return true;
+}
+
+// Does argv[i] name this flag? Matches both the separated form ("-t 8", *val
+// left NULL for the caller to fill from argv[i+1]) and the joined one ("-t=8").
+static bool is_flag(const char *arg, const char *flag, const char **val)
+{
+    size_t n = strlen(flag);
+    if (strncmp(arg, flag, n) != 0) return false;
+    if (arg[n] == '\0') { *val = NULL;        return true; }
+    if (arg[n] == '=')  { *val = arg + n + 1; return true; }
+    return false;                    // a longer flag that merely starts the same
+}
+
+static void usage(const char *prog)
+{
+    printf("Usage: %s [digits] [options]\n"
+           "\n"
+           "  digits            decimals of pi to compute; prompts if omitted.\n"
+           "                    Accepts a k/M/G suffix or exponent: 50M, 2.5M, 1e8\n"
+           "\n"
+           "  -o, --out [FILE]  also write the digits out (default: pi.txt)\n"
+           "                    -p and --print are accepted as aliases\n"
+           "  -t, --threads N   OpenMP threads to use (default: all)\n"
+           "  -q, --quiet       skip the system info banner\n"
+           "  -h, --help        this message\n"
+           "\n"
+           "Options take their value joined or separated: -t8 is not accepted,\n"
+           "but -t 8 and -t=8 both are.\n"
+           "\n"
+           "  %s 50M -t 8            50M digits on 8 threads, no output file\n"
+           "  %s 1e6 -o pi1m.txt     one million digits, written to pi1m.txt\n"
+           "\n"
+           "With no digits argument the original interactive prompts are used.\n",
+           prog, prog, prog);
+}
 
 int main(int argc, char **argv)
 {
@@ -424,35 +636,106 @@ int main(int argc, char **argv)
     setpriority(PRIO_PROCESS, 0, -10);   // needs privilege to go negative
 #endif
 
-    unsigned long n;
-    printf("Number of digits: ");
-    fflush(stdout);
-    if (scanf("%lu", &n) != 1) { return 1; }
+// Note: capping glibc's per-thread malloc arenas (mallopt(M_ARENA_MAX, 2))
+// cuts peak RSS by ~30% at 50M digits, but costs enough time to not be worth
+// it -- the workers end up contending for the two arenas. Left out on purpose.
+// It can still be tried from the outside with MALLOC_ARENA_MAX=2 in the env.
 
-    // pass -p to also write the digits to a file
-    bool print = (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'p');
-
-    // if -p, the next stdin line is the output filename (blank = default pi.txt)
+    unsigned long n = 0;
+    bool have_n = false, print = false, have_file = false, quiet = false;
+    int threads = 0;                     // 0 = leave OpenMP's default alone
     char filename[512] = "pi.txt";
-    if (print) {
-        printf("File name (empty for pi.txt): ");
-        fflush(stdout);
-        int c;
-        while ((c = getchar()) != '\n' && c != EOF) {}   // finish n's line
-        char line[512];
-        if (fgets(line, sizeof line, stdin)) {
-            size_t len = strlen(line);
-            while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-                line[--len] = '\0';                      // trim newline / CR
-            if (len > 0)
-                memcpy(filename, line, len + 1);
+
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i], *val = NULL;
+        char *end = NULL;
+
+        if (is_flag(a, "-h", &val) || is_flag(a, "--help", &val)) {
+            usage(argv[0]);
+            return 0;
+        } else if (is_flag(a, "-q", &val) || is_flag(a, "--quiet", &val)) {
+            quiet = true;
+        } else if (is_flag(a, "-o",     &val) || is_flag(a, "--out",   &val) ||
+                   is_flag(a, "-p",     &val) || is_flag(a, "--print", &val)) {
+            print = true;
+            // The filename is optional. A following word is taken as one only if
+            // it isn't the digit count: "./main -o 1M" means 1M digits to the
+            // default pi.txt, not a file called "1M". Use -o=1M to force that.
+            if (!val && i + 1 < argc && argv[i + 1][0] != '-') {
+                unsigned long ignored;
+                if (!parse_digits(argv[i + 1], &ignored))
+                    val = argv[++i];
+            }
+            if (val && *val != '\0') {
+                snprintf(filename, sizeof filename, "%s", val);
+                have_file = true;
+            }
+        } else if (is_flag(a, "-t", &val) || is_flag(a, "--threads", &val)) {
+            if (!val && i + 1 < argc) val = argv[++i];
+            long v = val ? strtol(val, &end, 10) : 0;
+            if (!val || *end != '\0' || v < 1 || v > 4096) {
+                fprintf(stderr, "%s needs a thread count >= 1\n", a);
+                return 1;
+            }
+            threads = (int)v;
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "unknown option: %s\n", a);
+            usage(argv[0]);
+            return 1;
+        } else if (!have_n) {
+            if (!parse_digits(a, &n)) {
+                fprintf(stderr, "not a digit count: %s\n", a);
+                return 1;
+            }
+            have_n = true;
+        } else {
+            fprintf(stderr, "unexpected argument: %s\n", a);
+            usage(argv[0]);
+            return 1;
         }
     }
 
-    // 640320^3 / 24, shared constant used by bs. Exact: 640320^3 is divisible by 24.
-    mpz_init(C3_24);
-    mpz_ui_pow_ui(C3_24, 640320, 3);
-    mpz_divexact_ui(C3_24, C3_24, 24);
+#ifdef _OPENMP
+    // Before anything reads omp_get_max_threads() -- print_sysinfo reports it and
+    // bs_chudnovsky sizes par_depth from it. Same effect as OMP_NUM_THREADS.
+    if (threads > 0) omp_set_num_threads(threads);
+#else
+    if (threads > 0)
+        fprintf(stderr, "note: built without OpenMP, ignoring -t\n");
+#endif
+
+    // No digit count on the command line -> the original interactive path.
+    if (!have_n) {
+        printf("Number of digits: ");
+        fflush(stdout);
+        if (scanf("%lu", &n) != 1) { return 1; }
+
+        // if -p, the next stdin line is the output filename (blank = default pi.txt)
+        if (print && !have_file) {
+            printf("File name (empty for pi.txt): ");
+            fflush(stdout);
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF) {}   // finish n's line
+            char line[512];
+            if (fgets(line, sizeof line, stdin)) {
+                size_t len = strlen(line);
+                while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+                    line[--len] = '\0';                      // trim newline / CR
+                if (len > 0)
+                    memcpy(filename, line, len + 1);
+            }
+        }
+    }
+
+    if (!quiet) {
+        print_sysinfo();
+        printf("Run:     %lu digits%s%s\n\n", n,
+               print ? " -> " : "", print ? filename : "");
+    }
+
+    // 640320^3 / 24, shared constant used by bs (640320^3 = 262537412640768000 is
+    // divisible by 24). set_str, not set_ui: it exceeds a 32-bit unsigned long.
+    mpz_init_set_str(C3_24, "10939058860032000", 10);
 
     mpz_t pi_bs;
     mpz_init(pi_bs);
@@ -460,10 +743,16 @@ int main(int argc, char **argv)
     typedef std::chrono::steady_clock clock;
     typedef std::chrono::duration<double> secs;
 
+    char tbuf[64], mbuf[64];
+
     auto s = clock::now();
     bs_chudnovsky(pi_bs, n);
     double t_bs = secs(clock::now() - s).count();
-    printf("binary splitting: %.8fs\n", t_bs);
+    // Sampled here, before write_pi allocates, so the two phases can be told
+    // apart: this is the tree's high-water mark, which is what sets the ceiling.
+    double peak_bs = peak_rss_mb();
+    format_secs(tbuf, sizeof tbuf, t_bs);
+    printf("binary splitting: %s\n", tbuf);
 
     if (print) {
         // pi_bs is the integer "3" followed by n decimals; split off the
@@ -476,9 +765,22 @@ int main(int argc, char **argv)
             write_pi(f, pi_bs, n);
             double t_out = secs(clock::now() - so).count();
             fclose(f);
-            printf("output:           %.8fs  (wrote %lu digits to %s)\n",
-                   t_out, n, filename);
+            format_secs(tbuf, sizeof tbuf, t_out);
+            printf("output:           %s  (wrote %lu digits to %s)\n",
+                   tbuf, n, filename);
         }
+    }
+
+    // Peak RSS, and whether output pushed past what the tree already held.
+    double peak = peak_rss_mb();
+    if (peak > 0.0) {
+        format_mem(mbuf, sizeof mbuf, peak);
+        printf("peak memory:      %s", mbuf);
+        if (print && peak > peak_bs * 1.01) {
+            format_mem(tbuf, sizeof tbuf, peak_bs);
+            printf("  (%s in binary splitting, rest is output)", tbuf);
+        }
+        printf("\n");
     }
 
     mpz_clear(pi_bs);
