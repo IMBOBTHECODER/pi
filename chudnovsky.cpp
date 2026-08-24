@@ -1,3 +1,5 @@
+// Copyright (C) 2026  Pham Tien Dat
+
 #include <gmp.h>
 #include <chrono>
 #include <cstdio>

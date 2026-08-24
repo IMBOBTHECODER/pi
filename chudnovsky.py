@@ -1,3 +1,5 @@
+# Copyright (C) 2026  Pham Tien Dat
+
 import gmpy2
 import time
 import math
